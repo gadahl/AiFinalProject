@@ -1,7 +1,6 @@
 import dotenv
 import os
 from pathlib import Path
-
 import tensorflow as tf
 from keras import layers, Model
 from keras.preprocessing import image
@@ -10,6 +9,8 @@ import os
 import random
 import keras
 from keras.models import load_model
+import cv2
+import matplotlib.pyplot as plt
 
 # -----------------------------
 # PATH LOADING FUNCTIONS
@@ -33,6 +34,7 @@ def load_env(env_path:str="paths.env") -> dict[str, str] | None:
             "SAVE_PATH": "siamese_eye_model.keras",
             "GALLERY_DIR": "Gallery",
             "QUERY_IMAGE_PATH": "query_image.jpg",
+            "TEST_IMAGE_PATH": "TestImages"
         }
 
         with open(env_path, 'wt') as f:
@@ -59,8 +61,9 @@ def build_paths(env: dict[str, str]) -> tuple[Path, Path, Path, Path]:
     save = (root_path / Path(env.get("SAVE_PATH"))).resolve()
     gallery = (root_path / Path(env.get("GALLERY_DIR"))).resolve()
     query_image = (root_path / Path(env.get("QUERY_IMAGE_PATH"))).resolve()
+    test = (root_path / Path(env.get("TEST_IMAGE_PATH"))).resolve()
 
-    return (dataset, save, gallery, query_image)
+    return (dataset, save, gallery, query_image,test)
 
 
 
@@ -69,21 +72,35 @@ def build_paths(env: dict[str, str]) -> tuple[Path, Path, Path, Path]:
 # -----------------------------
 def load_images_by_filename(dataset_path, img_size):
     """
-    Load images and group them by person_id extracted from filename (e.g., C1_S1).
+    Load images, crop eyes, group them by person_id.
+    Ignore images without eyes.
     """
     images_dict = {}
     for img_name in os.listdir(dataset_path):
         if img_name.lower().endswith((".png", ".jpg", ".jpeg")):
-            person_id = "_".join(img_name.split("_")[:2])  # e.g., C1_S1
+            person_id = "_".join(img_name.split("_")[:2])
             img_path = os.path.join(dataset_path, img_name)
-            img = image.load_img(img_path, target_size=img_size)
-            img = image.img_to_array(img) / 255.0
+            img = image.load_img(img_path)
+            img = image.img_to_array(img).astype(np.uint8)  # Keep uint8 for eye detector
+
+            # Detect eye
+            cropped = detect_eye(img)
+            if cropped is None:
+                continue  # Skip images without eyes
+
+            # Resize to model input size
+            cropped = tf.image.resize(cropped, img_size[:2])
+            cropped = cropped / 255.0  # normalize
+
             if person_id not in images_dict:
                 images_dict[person_id] = []
-            images_dict[person_id].append(img)
+            images_dict[person_id].append(cropped)
+
     if not images_dict:
-        raise ValueError("No images found in dataset. Check DATASET_PATH and file names.")
+        raise ValueError("No images with eyes found in dataset. Check dataset and detection.")
+
     return images_dict
+
 
 def siamese_batch_generator(images_dict, batch_size, img_size): 
     """ 
@@ -185,7 +202,8 @@ def create_siamese_model(input_shape):
     feat_b = base_model(input_b)
     distance = layers.Lambda(euclidean_distance)([feat_a, feat_b])
     model = Model([input_a, input_b], distance)
-    return model
+    return model, base_model
+
 
 # -----------------------------
 # CONTRASTIVE LOSS
@@ -263,46 +281,198 @@ def load_gallery_embeddings(gallery_root):
                                       if f.lower().endswith((".png", ".jpg", ".jpeg"))]
     return gallery_dict
 
-def identify_eye(model, query_img_path, gallery_dict, img_size, margin=1.0, threshold=70.0):
+# -----------------------------
+# Compute gallery embeddings
+# -----------------------------
+def compute_gallery_embeddings(base_cnn, gallery_dict, img_size, embedding_cache_path=None):
     """
-    Identify the identity of a query eye image.
-    - model: trained Siamese network
-    - query_img_path: path to the query image
-    - gallery_dict: {identity: [list of image paths]}
-    - margin: used for similarity scaling
-    - threshold: minimum similarity (%) to accept as known identity
+    Computes embeddings for all gallery images using the base CNN.
+    Stores each embedding together with the image path.
     """
-    # Load and preprocess query image
-    query_img = image.load_img(query_img_path, target_size=img_size)
-    query_img = image.img_to_array(query_img) / 255.0
-    query_img = np.expand_dims(query_img, axis=0)
+    embeddings_dict = {}
 
-    identity_scores = {}
+    if embedding_cache_path and os.path.exists(embedding_cache_path):
+        try:
+            embeddings_dict = np.load(embedding_cache_path, allow_pickle=True).item()
+            print(f"Loaded cached embeddings from {embedding_cache_path}")
+            return embeddings_dict
+        except Exception as e:
+            print(f"Failed to load cached embeddings, recomputing: {e}")
 
     for identity, img_paths in gallery_dict.items():
-        similarities = []
-        for g_path in img_paths:
+        embeddings_dict[identity] = []
+        for img_path in img_paths:
             try:
-                g_img = image.load_img(g_path, target_size=img_size)
-                g_img = image.img_to_array(g_img)/255.0
-                g_img = np.expand_dims(g_img, axis=0)
-                distance = float(model.predict([query_img, g_img], verbose=0)[0,0])
-                similarity = (1 - np.tanh(distance / margin)) * 100
-                similarities.append(similarity)
+                img = image.load_img(img_path, target_size=img_size)
+                img_arr = image.img_to_array(img) / 255.0
+                img_arr = np.expand_dims(img_arr, axis=0)
+                emb = base_cnn.predict(img_arr, verbose=0)[0]
+                embeddings_dict[identity].append((emb, img_path))  # <-- store as tuple
             except Exception as e:
-                print(f"Skipping {g_path}: {e}")
-        if similarities:
-            # Take maximum similarity among images for this identity
-            identity_scores[identity] = max(similarities)
+                print(f"Skipping {img_path}: {e}")
 
-    if not identity_scores:
-        return "No gallery images found", 0.0
+    if embedding_cache_path:
+        np.save(embedding_cache_path, embeddings_dict)
+        print(f"Saved embeddings to {embedding_cache_path}")
 
-    # Determine the best match
-    best_identity = max(identity_scores, key=identity_scores.get)
-    best_score = identity_scores[best_identity]
+    return embeddings_dict
+
+
+
+
+# -----------------------------
+# Identify query image
+# -----------------------------
+def identify_eye(query_img_path, base_cnn, gallery_embeddings, img_size, margin=1.0, threshold=70.0):
+    """
+    Identify a query image after detecting and cropping eye.
+    Displays the query and the closest matching gallery image.
+    """
+    # Load and preprocess the query image
+    img = image.load_img(query_img_path)
+    img_arr = image.img_to_array(img).astype(np.uint8)
+    
+    cropped_query = detect_eye(img_arr)
+    if cropped_query is None:
+        print("No eye detected in query image.")
+        display_query = np.clip(tf.image.resize(img_arr, img_size[:2]).numpy(), 0, 255).astype(np.uint8)
+        
+        plt.figure(figsize=(3, 3))
+        plt.imshow(display_query)
+        plt.title("Query Image (No Eye Detected)")
+        plt.axis('off')
+        plt.show()
+        return "No eye detected", 0.0
+    
+    # Resize and normalize for model
+    cropped_resized = tf.image.resize(cropped_query, img_size[:2])
+    cropped_input = cropped_resized / 255.0
+    cropped_input = np.expand_dims(cropped_input, axis=0)
+
+    # Compute embedding
+    query_embedding = base_cnn.predict(cropped_input, verbose=0)[0]
+
+    # Compare with gallery embeddings
+    best_score = -1
+    best_identity = None
+    best_gallery_image = None
+
+    for identity, emb_path_list in gallery_embeddings.items():
+        for embedding, path in emb_path_list:
+            distance = np.linalg.norm(query_embedding - embedding)
+            similarity = (1 - np.tanh(distance / margin)) * 100
+            if similarity > best_score:
+                best_score = similarity
+                best_identity = identity
+                best_gallery_image = path  # use exact path stored
+
+    if best_identity is None:
+        print("No gallery embeddings found.")
+        return "No gallery embeddings found", 0.0
+
+    # Prepare images for display
+    display_query = np.clip(cropped_resized.numpy(), 0, 255).astype(np.uint8)
+    gallery_img = image.load_img(best_gallery_image, target_size=img_size)
+    display_gallery = np.clip(image.img_to_array(gallery_img), 0, 255).astype(np.uint8)
+
+    # Display query and closest match
+    plt.figure(figsize=(6, 3))
+    plt.subplot(1,2,1)
+    plt.imshow(display_query)
+    plt.title("Query Eye")
+    plt.axis('off')
+
+    plt.subplot(1,2,2)
+    plt.imshow(display_gallery)
+    plt.title(f"Closest Match: {best_identity}")
+    plt.axis('off')
+    plt.show()
 
     if best_score >= threshold:
         return best_identity, best_score
     else:
         return "Unknown", best_score
+
+
+
+
+
+
+    
+def detect_eye(image_array):
+    """
+    Detects eyes in an image (numpy array or PIL image).
+    Returns cropped eye image as numpy array if found, else None.
+    """
+    # Convert to grayscale
+    gray = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
+
+    # Load Haar cascade for eyes
+    eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
+
+    eyes = eye_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
+
+    if len(eyes) == 0:
+        return None  # No eye detected
+
+    # Take first detected eye
+    x, y, w, h = eyes[0]
+    cropped_eye = image_array[y:y+h, x:x+w]
+    return cropped_eye
+
+import os
+from keras.preprocessing import image
+import numpy as np
+import tensorflow as tf
+
+def crop_gallery_images(gallery_root, detect_eye_fn, img_size=(105, 105)):
+    """
+    Crop all images in the gallery that contain eyes.
+    
+    Parameters:
+    - gallery_root: path to the gallery folder (each subfolder is an identity)
+    - detect_eye_fn: a function that takes a numpy image array and returns the cropped eye or None
+    - img_size: size to resize cropped images
+    
+    This function replaces the original images with cropped ones, deletes images with no eyes,
+    and appends '_cropped' to filenames to avoid double cropping.
+    """
+    for identity in os.listdir(gallery_root):
+        identity_path = os.path.join(gallery_root, identity)
+        if not os.path.isdir(identity_path):
+            continue
+        
+        for fname in os.listdir(identity_path):
+            fpath = os.path.join(identity_path, fname)
+            if not fname.lower().endswith((".png", ".jpg", ".jpeg")):
+                continue
+            
+            # Skip already cropped images
+            if "_cropped" in fname:
+                continue
+            
+            try:
+                img = image.load_img(fpath)
+                img_arr = image.img_to_array(img).astype(np.uint8)
+                cropped = detect_eye_fn(img_arr)
+                
+                if cropped is None:
+                    # Delete images without eyes
+                    os.remove(fpath)
+                    print(f"Deleted {fpath} (no eye detected)")
+                    continue
+                
+                # Resize and save cropped image
+                cropped_resized = tf.image.resize(cropped, img_size[:2])
+                cropped_resized = np.clip(cropped_resized.numpy(), 0, 255).astype(np.uint8)
+                
+                base, ext = os.path.splitext(fname)
+                new_fname = base + "_cropped" + ext
+                new_path = os.path.join(identity_path, new_fname)
+                
+                image.array_to_img(cropped_resized).save(new_path)
+                os.remove(fpath)  # Remove original
+                print(f"Cropped and saved {new_path}")
+            
+            except Exception as e:
+                print(f"Error processing {fpath}: {e}")
