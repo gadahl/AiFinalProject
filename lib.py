@@ -12,59 +12,81 @@ from keras.models import load_model
 import cv2
 import matplotlib.pyplot as plt
 
-# -----------------------------
-# PATH LOADING FUNCTIONS
-# -----------------------------
 
-def load_env(env_path:str="paths.env") -> dict[str, str] | None:
-    path = os.path.abspath(env_path)
+class EnvLoader:
+    """
+    On creation, members of this class will load path settings from 
+    the specified .env file, do some path manipulation, 
+    and then save those paths as fields.
+    """
+    def __init__(self, env_path:str="paths.env"):
+
+        self.defaults = {
+                "RAW_IMAGE_DIR": "UBIPeriocular",
+                "MODEL_SAVE_FILE": "siamese_eye_model.keras",
+                "GALLERY_IMAGE_DIR": "Gallery",
+                "GALLERY_EMBEDDING_FILE": "gallery_embeddings.npy",
+                "QUERY_IMAGE_FILE": "query_image.jpg",
+                "TEST_IMAGE_DIR": "TestImages",
+                "PROCESSED_IMAGE_FILE": "images_dict.npy"
+            }
+
+        abs_env_path = os.path.abspath(env_path)
     
-    if Path(path).exists():
-        return dotenv.dotenv_values(os.path.abspath(env_path))
-    
-    else:
-        prompt = f"Did not find environment file '{path or env_path}'.\nDo you want to generate it? [y/n]\n"
-        response = input(prompt).strip().lower()
-        if response not in ['y', 'yes']:
-            return None
+        if Path(abs_env_path).exists():
+            env = dotenv.dotenv_values(abs_env_path)
         
-        env = {
-            "ROOT_DIR": os.getcwd(),
-            "DATASET_DIR": "UBIPeriocular",
-            "SAVE_PATH": "siamese_eye_model.keras",
-            "GALLERY_DIR": "Gallery",
-            "QUERY_IMAGE_PATH": "query_image.jpg",
-            "TEST_IMAGE_PATH": "TestImages"
-        }
+        else:
+            prompt = f"Did not find environment file '{abs_env_path or env_path}'.\n" 
+            prompt += "Do you want to generate it? [y/n]\n"
+            response = input(prompt).strip().lower()
+            if response not in ['y', 'yes']:
+                raise Exception("No environment file")
+            
+            env = self.defaults.copy()
+            env.update({"ROOT_DIR": os.getcwd()})
 
-        with open(env_path, 'wt') as f:
-            for (k,v) in env.items():
-                f.write(k + "=" + v + "\n")
-            f.flush()
+            with open(env_path, 'wt') as f:
+                for (k,v) in env.items():
+                    f.write(k + "=" + v + "\n")
+                f.flush()
+        
+        self.build_paths(env)
 
-        return env
 
+    def build_paths(self, env: dict[str, str]):
+        
+        for key in self.defaults.keys():
+            value = env.get(key)
+            if value is None:
+                msg = f"Env variable '{key}' not found. "
+                msg += "Try deleting your .env file and re-running the program."
+                raise Exception(msg)
 
-def build_paths(env: dict[str, str]) -> tuple[Path, Path, Path, Path]:
+        if "ROOT_DIR" in env:
+            self.ROOT_DIR = Path(env.get("ROOT_DIR")).expanduser()
+        else:
+            self.ROOT_DIR = Path(os.getcwd()).resolve()
+
+        self.RAW_IMAGE_PATH = (self.ROOT_DIR / Path(env.get("RAW_IMAGE_DIR"))).resolve()
+        self.MODEL_SAVE_PATH = (self.ROOT_DIR / Path(env.get("MODEL_SAVE_FILE"))).resolve()
+        self.GALLERY_IMAGE_PATH = (self.ROOT_DIR / Path(env.get("GALLERY_IMAGE_DIR"))).resolve()
+        self.GALLERY_EMBEDDING_PATH = (self.ROOT_DIR / Path(env.get("GALLERY_EMBEDDING_FILE"))).resolve()
+        self.QUERY_IMAGE_PATH = (self.ROOT_DIR / Path(env.get("QUERY_IMAGE_FILE"))).resolve()
+        self.TEST_IMAGE_PATH = (self.ROOT_DIR / Path(env.get("TEST_IMAGE_DIR"))).resolve()
+        self.PROCESSED_IMAGE_PATH = (self.ROOT_DIR / Path(env.get("PROCESSED_IMAGE_FILE"))).resolve()
     
-    for key in ["DATASET_DIR", "SAVE_PATH", "GALLERY_DIR", "QUERY_IMAGE_PATH"]:
-        value = env.get(key)
-        if value is None:
-            raise Exception(f"env variable '{key}' not found")
 
-    if "ROOT_DIR" in env:
-        root_path = Path(env.get("ROOT_DIR")).expanduser()
-    else:
-        root_path = os.getcwd()
-
-    dataset = (root_path / Path(env.get("DATASET_DIR"))).resolve()
-    save = (root_path / Path(env.get("SAVE_PATH"))).resolve()
-    gallery = (root_path / Path(env.get("GALLERY_DIR"))).resolve()
-    query_image = (root_path / Path(env.get("QUERY_IMAGE_PATH"))).resolve()
-    test = (root_path / Path(env.get("TEST_IMAGE_PATH"))).resolve()
-
-    return (dataset, save, gallery, query_image,test)
-
+    def __str__(self):
+        return f"""EnvLoader[
+          RAW_IMAGE_PATH={self.RAW_IMAGE_PATH}
+         MODEL_SAVE_PATH={self.MODEL_SAVE_PATH}
+      GALLERY_IMAGE_PATH={self.GALLERY_IMAGE_PATH}
+  GALLERY_EMBEDDING_PATH={self.GALLERY_EMBEDDING_PATH}
+        QUERY_IMAGE_PATH={self.QUERY_IMAGE_PATH}
+         TEST_IMAGE_PATH={self.TEST_IMAGE_PATH}
+    PROCESSED_IMAGE_PATH={self.PROCESSED_IMAGE_PATH}
+]"""
 
 
 # -----------------------------
@@ -76,6 +98,10 @@ def load_images_by_filename(dataset_path, img_size):
     Ignore images without eyes.
     """
     images_dict = {}
+    
+    # Load Haar cascade for eyes
+    eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
+
     for img_name in os.listdir(dataset_path):
         if img_name.lower().endswith((".png", ".jpg", ".jpeg")):
             person_id = "_".join(img_name.split("_")[:2])
@@ -84,7 +110,7 @@ def load_images_by_filename(dataset_path, img_size):
             img = image.img_to_array(img).astype(np.uint8)  # Keep uint8 for eye detector
 
             # Detect eye
-            cropped = detect_eye(img)
+            cropped = detect_eye(img, eye_cascade)
             if cropped is None:
                 continue  # Skip images without eyes
 
@@ -186,7 +212,7 @@ def create_base_cnn(input_shape):
 @keras.saving.register_keras_serializable()
 def euclidean_distance(vects):
     """
-    Calculatees similarity in features of 2 images in terms of euclidean distance.
+    Calculates similarity in features of 2 images in terms of euclidean distance.
     """
     x, y = vects
     return tf.sqrt(tf.reduce_sum(tf.square(x - y), axis=1, keepdims=True))
@@ -236,7 +262,7 @@ def siamese_accuracy(y_true, y_pred, threshold=0.5):
 # -----------------------------
 # SAVE MODEL
 # -----------------------------
-def save_siamese_model(model, save_path="siamese_eye_model"):
+def save_siamese_model(model, save_path):
     """
     Saves the entire model (structure + weights + optimizer state)
     to a .keras format (recommended).
@@ -267,9 +293,9 @@ def load_siamese_model(save_path):
 
 
 
-def load_gallery_embeddings(gallery_root):
+def load_gallery_images(gallery_root):
     """
-    Loads all images from the gallery and computes embeddings.
+    Loads all images from the gallery.
     Returns a dict: {identity: [image_paths]}
     """
     gallery_dict = {}
@@ -331,14 +357,16 @@ def identify_eye(query_img_path, base_cnn, gallery_embeddings, img_size, margin=
     # Load and preprocess the query image
     img = image.load_img(query_img_path)
     img_arr = image.img_to_array(img).astype(np.uint8)
+
+    eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
     
-    cropped_query = detect_eye(img_arr)
+    cropped_query = detect_eye(img_arr, eye_cascade)
     if cropped_query is None:
         print("No eye detected in query image.")
         return "No eye detected", 0.0
     
     # Resize and normalize for model
-    cropped_resized = tf.image.resize(cropped_query, img_size[:2])
+    cropped_resized = tf.image.resize(cropped_query, img_size)
     cropped_input = cropped_resized / 255.0
     cropped_input = np.expand_dims(cropped_input, axis=0)
 
@@ -392,16 +420,13 @@ def identify_eye(query_img_path, base_cnn, gallery_embeddings, img_size, margin=
 
 
     
-def detect_eye(image_array):
+def detect_eye(image_array: np.array, eye_cascade: cv2.CascadeClassifier) -> np.array:
     """
-    Detects eyes in an image (numpy array or PIL image).
+    Detects eyes in an image (numpy array).
     Returns cropped eye image as numpy array if found, else None.
     """
     # Convert to grayscale
     gray = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
-
-    # Load Haar cascade for eyes
-    eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
 
     eyes = eye_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
 
@@ -413,23 +438,20 @@ def detect_eye(image_array):
     cropped_eye = image_array[y:y+h, x:x+w]
     return cropped_eye
 
-import os
-from keras.preprocessing import image
-import numpy as np
-import tensorflow as tf
 
-def crop_gallery_images(gallery_root, detect_eye_fn, img_size=(105, 105)):
+def crop_gallery_images(gallery_root, img_size):
     """
     Crop all images in the gallery that contain eyes.
     
     Parameters:
     - gallery_root: path to the gallery folder (each subfolder is an identity)
-    - detect_eye_fn: a function that takes a numpy image array and returns the cropped eye or None
     - img_size: size to resize cropped images
     
     This function replaces the original images with cropped ones, deletes images with no eyes,
     and appends '_cropped' to filenames to avoid double cropping.
     """
+    eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
+
     for identity in os.listdir(gallery_root):
         identity_path = os.path.join(gallery_root, identity)
         if not os.path.isdir(identity_path):
@@ -447,7 +469,7 @@ def crop_gallery_images(gallery_root, detect_eye_fn, img_size=(105, 105)):
             try:
                 img = image.load_img(fpath)
                 img_arr = image.img_to_array(img).astype(np.uint8)
-                cropped = detect_eye_fn(img_arr)
+                cropped = detect_eye(img_arr, eye_cascade)
                 
                 if cropped is None:
                     # Delete images without eyes
@@ -456,7 +478,7 @@ def crop_gallery_images(gallery_root, detect_eye_fn, img_size=(105, 105)):
                     continue
                 
                 # Resize and save cropped image
-                cropped_resized = tf.image.resize(cropped, img_size[:2])
+                cropped_resized = tf.image.resize(cropped, img_size)
                 cropped_resized = np.clip(cropped_resized.numpy(), 0, 255).astype(np.uint8)
                 
                 base, ext = os.path.splitext(fname)
