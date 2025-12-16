@@ -363,6 +363,13 @@ def identify_eye(query_img_path, base_cnn, gallery_embeddings, img_size, margin=
     cropped_query = detect_eye(img_arr, eye_cascade)
     if cropped_query is None:
         print("No eye detected in query image.")
+        display_query = np.clip(tf.image.resize(img_arr, img_size[:2]).numpy(), 0, 255).astype(np.uint8)
+        
+        plt.figure(figsize=(3, 3))
+        plt.imshow(display_query)
+        plt.title("Query Image (No Eye Detected)")
+        plt.axis('off')
+        plt.show()
         return "No eye detected", 0.0
     
     # Resize and normalize for model
