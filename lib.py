@@ -274,10 +274,6 @@ def save_siamese_model(model, save_path):
 # -----------------------------
 # LOAD MODEL
 # -----------------------------
-def euclidean_distance(vects):
-    x, y = vects
-    return tf.sqrt(tf.reduce_sum(tf.square(x - y), axis=1, keepdims=True))
-
 def contrastive_loss(y_true, y_pred, margin=1.0):
     y_true = tf.cast(y_true, y_pred.dtype)
     square_pred = tf.square(y_pred)
@@ -292,7 +288,9 @@ def load_siamese_model(save_path):
 
 
 
-
+# -----------------------------
+# GALLERY FUNCTIONS
+# -----------------------------
 def load_gallery_images(gallery_root):
     """
     Loads all images from the gallery.
@@ -307,15 +305,7 @@ def load_gallery_images(gallery_root):
                                       if f.lower().endswith((".png", ".jpg", ".jpeg"))]
     return gallery_dict
 
-# -----------------------------
-# Compute gallery embeddings
-# -----------------------------
-def compute_gallery_embeddings(base_cnn, gallery_dict, img_size, embedding_cache_path=None):
-    """
-    Computes embeddings for all gallery images using the base CNN.
-    Stores each embedding together with the image path.
-    """
-    embeddings_dict = {}
+def load_gallery_embeddings(embedding_cache_path):
 
     if embedding_cache_path and os.path.exists(embedding_cache_path):
         try:
@@ -323,8 +313,18 @@ def compute_gallery_embeddings(base_cnn, gallery_dict, img_size, embedding_cache
             print(f"Loaded cached embeddings from {embedding_cache_path}")
             return embeddings_dict
         except Exception as e:
-            print(f"Failed to load cached embeddings, recomputing: {e}")
+            print(f"Failed to load cached embeddings: {e}")
+    
+    print(f"Embeddings do not exist at {embedding_cache_path}")
+    return None
 
+def compute_gallery_embeddings(base_cnn, gallery_dict, img_size, embedding_cache_path=None):
+    """
+    Computes embeddings for all gallery images using the base CNN.
+    Stores each embedding together with the image path.
+    """
+    embeddings_dict = {}
+    
     for identity, img_paths in gallery_dict.items():
         embeddings_dict[identity] = []
         for img_path in img_paths:
@@ -349,7 +349,7 @@ def compute_gallery_embeddings(base_cnn, gallery_dict, img_size, embedding_cache
 # -----------------------------
 # Identify query image
 # -----------------------------
-def identify_eye(query_img_path, base_cnn, gallery_embeddings, img_size, margin=1.0, threshold=70.0):
+def identify_eye(query_img_path, img_name, base_cnn, gallery_embeddings, img_size, margin=1.0, threshold=70.0):
     """
     Identify a query image after detecting and cropping eye.
     Displays the query and the closest matching gallery image.
@@ -362,12 +362,11 @@ def identify_eye(query_img_path, base_cnn, gallery_embeddings, img_size, margin=
     
     cropped_query = detect_eye(img_arr, eye_cascade)
     if cropped_query is None:
-        print("No eye detected in query image.")
         display_query = np.clip(tf.image.resize(img_arr, img_size[:2]).numpy(), 0, 255).astype(np.uint8)
         
         plt.figure(figsize=(3, 3))
         plt.imshow(display_query)
-        plt.title("Query Image (No Eye Detected)")
+        plt.title(img_name + " (No Eye Detected)")
         plt.axis('off')
         plt.show()
         return "No eye detected", 0.0
@@ -403,23 +402,26 @@ def identify_eye(query_img_path, base_cnn, gallery_embeddings, img_size, margin=
     gallery_img = image.load_img(best_gallery_image, target_size=img_size)
     display_gallery = np.clip(image.img_to_array(gallery_img), 0, 255).astype(np.uint8)
 
+    identity = best_identity if best_score >= threshold else "Unknown"
+    result_message = f"Eye in '{img_name}' identified as '{identity}' with confidence {best_score:.2f}%"
+
     # Display query and closest match
     plt.figure(figsize=(6, 3))
     plt.subplot(1,2,1)
     plt.imshow(display_query)
-    plt.title("Query Eye")
+    plt.title(img_name)
     plt.axis('off')
 
     plt.subplot(1,2,2)
     plt.imshow(display_gallery)
     plt.title(f"Closest Match: {best_identity}")
     plt.axis('off')
+    
+    plt.figtext(0.5, 0.02, result_message, ha='center', fontsize=10)
+    plt.tight_layout(rect=[0, 0.04, 1, 1])
     plt.show()
 
-    if best_score >= threshold:
-        return best_identity, best_score
-    else:
-        return "Unknown", best_score
+    return identity, best_score
 
 
 
